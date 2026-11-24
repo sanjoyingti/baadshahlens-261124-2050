@@ -7,6 +7,7 @@ import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PointF
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
@@ -18,7 +19,8 @@ import kotlin.math.hypot
 import kotlin.math.max
 
 /**
- * Renders the nude body template on the GL overlay canvas, warped onto the tracked joints.
+ * Renders the nude body template on the GL overlay canvas or onto a captured photo,
+ * warped onto the tracked joints (shoulders, hips, waist, knees).
  */
 class BodyOverlayRenderer {
 
@@ -28,12 +30,9 @@ class BodyOverlayRenderer {
     private val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val layerPaint = Paint()
 
-    data class Pose(
-        val uprightWidth: Float,
-        val uprightHeight: Float,
-        val matrix: Matrix
-    )
+    private data class Pose(val uprightWidth: Float, val uprightHeight: Float, val matrix: Matrix)
 
+    /** Live pass: clears the canvas, paints the fill and puts the real face/hair/hands back on top. */
     fun render(
         canvas: Canvas,
         frame: VisionPipeline.Frame,
@@ -45,10 +44,10 @@ class BodyOverlayRenderer {
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         val w = canvas.width.toFloat()
         val h = canvas.height.toFloat()
+        if (w <= 1f || h <= 1f) return
         val pose = mapping(rotationDegrees, w, h)
         val confidence = if (frame.present) 1f else (1f - (frame.ageMs / 3200f)).coerceIn(0f, 1f)
-        val alpha = (strength * globalAlpha * confidence * if (frame.present) 1f else 0.55f)
-            .coerceIn(0f, 1f)
+        val alpha = strength * globalAlpha * confidence * if (frame.present) 1f else 0.55f
         if (alpha <= 0.02f || frame.landmarks.size < 29) return
 
         val skin = frame.skin
@@ -56,14 +55,34 @@ class BodyOverlayRenderer {
 
         canvas.save()
         canvas.concat(pose.matrix)
-        val uw = pose.uprightWidth
-        val uh = pose.uprightHeight
-        drawBody(canvas, frame, uw, uh, alpha, gender, src, skin.lightX)
-        drawRealPixels(canvas, frame, uw, uh)
+        drawBody(canvas, frame, pose.uprightWidth, pose.uprightHeight, alpha, gender, src, skin.lightX)
+        drawRealPixels(canvas, frame, pose.uprightWidth, pose.uprightHeight)
         canvas.restore()
     }
 
-    /** White-on-black mask of the area to regenerate in the cloud, at the still's own size. */
+    /** Burns the fill onto a captured photo and puts the person's real face and hands back. */
+    fun composeStill(photo: Bitmap, frame: VisionPipeline.Frame, strength: Float, gender: Gender): Bitmap {
+        val base = photo.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(base)
+        val w = base.width.toFloat()
+        val h = base.height.toFloat()
+        if (frame.landmarks.size >= 29) {
+            val skin = frame.skin
+            val src = if (skin.valid) skin.color else Color.rgb(214, 172, 142)
+            drawBody(canvas, frame, w, h, strength.coerceIn(0f, 1f), gender, src, skin.lightX)
+            val rect = RectF(0f, 0f, w, h)
+            val checkpoint = canvas.saveLayer(rect, layerPaint)
+            canvas.drawBitmap(photo, null, rect, blendPaint)
+            maskPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+            maskPaint.isFilterBitmap = true
+            canvas.drawBitmap(frame.occluders, null, rect, maskPaint)
+            maskPaint.xfermode = null
+            canvas.restoreToCount(checkpoint)
+        }
+        return base
+    }
+
+    /** White-on-black mask of the area the cloud should regenerate, at the still's own size. */
     fun renderMask(frame: VisionPipeline.Frame, width: Int, height: Int, rotationDegrees: Int): Bitmap {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
@@ -74,13 +93,29 @@ class BodyOverlayRenderer {
         fillPaint.color = Color.WHITE
         fillPaint.style = Paint.Style.FILL
         fillPaint.shader = null
-        val uw = pose.uprightWidth
-        val uh = pose.uprightHeight
-        torsoPath(frame, uw, uh, Gender.MALE).let { canvas.drawPath(it, fillPaint) }
-        legsPaths(frame, uw, uh).forEach { canvas.drawPath(it, fillPaint) }
-        armPaths(frame, uw, uh).forEach { canvas.drawPath(it, fillPaint) }
+        torsoPath(frame, pose.uprightWidth, pose.uprightHeight, Gender.MALE)
+            .let { canvas.drawPath(it, fillPaint) }
+        legsPaths(frame, pose.uprightWidth, pose.uprightHeight).forEach { canvas.drawPath(it, fillPaint) }
+        armPaths(frame, pose.uprightWidth, pose.uprightHeight).forEach { canvas.drawPath(it, fillPaint) }
         canvas.restore()
         return bitmap
+    }
+
+    /** Puts the real face and hands back over a generated picture. */
+    fun blendBack(generated: Bitmap, original: Bitmap, occluders: Bitmap): Bitmap {
+        val base = generated.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(base)
+        val rect = RectF(0f, 0f, base.width.toFloat(), base.height.toFloat())
+        val checkpoint = canvas.saveLayer(rect, layerPaint)
+        val scaledOriginal = Bitmap.createScaledBitmap(original, base.width, base.height, true)
+        canvas.drawBitmap(scaledOriginal, null, rect, blendPaint)
+        maskPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+        maskPaint.isFilterBitmap = true
+        canvas.drawBitmap(occluders, null, rect, maskPaint)
+        maskPaint.xfermode = null
+        canvas.restoreToCount(checkpoint)
+        if (scaledOriginal !== original) scaledOriginal.recycle()
+        return base
     }
 
     private fun drawBody(
@@ -172,7 +207,7 @@ class BodyOverlayRenderer {
         val sl = px(frame.point(11), uw, uh)
         val sr = px(frame.point(12), uw, uh)
         val hl = px(frame.point(23), uw, uh)
-        val hr = px(frame.point(24), uh, uh)
+        val hr = px(frame.point(24), uw, uh)
         val waist = if (gender == Gender.FEMALE) 0.30f else 0.20f
         val hipFlare = if (gender == Gender.FEMALE) 0.16f else 0.08f
         val chest = if (gender == Gender.FEMALE) 0.24f else 0.12f
@@ -237,7 +272,7 @@ class BodyOverlayRenderer {
         return path
     }
 
-    private fun addTaper(path: Path, from: android.graphics.PointF, to: android.graphics.PointF, wFrom: Float, wTo: Float) {
+    private fun addTaper(path: Path, from: PointF, to: PointF, wFrom: Float, wTo: Float) {
         val dx = to.x - from.x
         val dy = to.y - from.y
         val length = hypot(dx, dy)
@@ -282,11 +317,9 @@ class BodyOverlayRenderer {
         return Pose(uprightWidth, uprightHeight, matrix)
     }
 
-    private fun px(point: android.graphics.PointF, uw: Float, uh: Float) =
-        android.graphics.PointF(point.x * uw, point.y * uh)
+    private fun px(point: PointF, uw: Float, uh: Float) = PointF(point.x * uw, point.y * uh)
 
-    private fun lerp(a: android.graphics.PointF, b: android.graphics.PointF, t: Float) =
-        android.graphics.PointF(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+    private fun lerp(a: PointF, b: PointF, t: Float) = PointF(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 
     private fun chestMass(gender: Gender): Float = if (gender == Gender.FEMALE) 12f else 7f
 

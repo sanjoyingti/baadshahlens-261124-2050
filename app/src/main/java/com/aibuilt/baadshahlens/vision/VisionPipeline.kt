@@ -14,6 +14,7 @@ import androidx.camera.core.ImageProxy
 import com.aibuilt.baadshahlens.data.settings.Gender
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenter
@@ -33,8 +34,10 @@ import kotlin.math.min
 class VisionPipeline {
 
     companion object {
-        const val ANALYSIS_SIZE = 256
-        const val MASK_SIZE = 64
+        const val ANALYSIS_W = 192
+        const val ANALYSIS_H = 256
+        const val MASK_W = 48
+        const val MASK_H = 64
         const val CLASS_BACKGROUND = 0
         const val CLASS_HAIR = 1
         const val CLASS_BODY_SKIN = 2
@@ -43,6 +46,8 @@ class VisionPipeline {
         const val CLASS_ACCESSORY = 5
         private const val LOST_HOLD_MS = 3000L
         private const val POSE_EVERY = 2
+        private const val LUMA_W = 32
+        private const val LUMA_H = 32
     }
 
     data class SkinSample(
@@ -120,6 +125,16 @@ class VisionPipeline {
 
     fun suggestedGender(): Gender? = genderHint
 
+    fun resetTracking() {
+        lastLandmarks.clear()
+        filters.clear()
+        lastRoi = null
+        lastConfidence = 0f
+        lastArea = 0f
+        lastCentroid = null
+        lastSeenAt = 0L
+    }
+
     fun analyze(proxy: ImageProxy): Frame? {
         if (!ready) {
             proxy.close()
@@ -129,6 +144,7 @@ class VisionPipeline {
         return try {
             val source = proxy.toBitmap()
             val scaled = uprightScaled(source, rotation)
+            if (source !== scaled) source.recycle()
             val stamp = System.currentTimeMillis()
             val luma = lumaOf(scaled)
             val shift = estimateShift(previousLuma, luma)
@@ -166,7 +182,7 @@ class VisionPipeline {
                 confidence = confidence,
                 ageMs = if (present) 0 else stamp - lastSeenAt,
                 area = lastArea,
-                classes = classes ?: IntArray(ANALYSIS_SIZE * ANALYSIS_SIZE),
+                classes = classes ?: IntArray(ANALYSIS_W * ANALYSIS_H),
                 occluders = occluders,
                 skin = skin
             )
@@ -193,21 +209,20 @@ class VisionPipeline {
         val crop = Bitmap.createBitmap(bitmap, rect.left, rect.top, rect.width(), rect.height())
         val image: MPImage = BitmapImageBuilder(crop).build()
         val result = landmarker.detect(image)
-        image.close()
         val poses = result.landmarks()
+        runCatching { result.close() }
+        image.close()
+        crop.recycle()
         if (poses.isEmpty()) return null
 
-        var best: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>? = null
+        var best: List<NormalizedLandmark>? = null
         var bestScore = -1f
         for (candidate in poses) {
             val box = boundsOf(candidate)
             val area = box.width() * box.height()
             var score = area
             lastCentroid?.let { previous ->
-                val distance = OneEuroFilter.distance(
-                    previous,
-                    PointF(box.centerX(), box.centerY())
-                )
+                val distance = OneEuroFilter.distance(previous, PointF(box.centerX(), box.centerY()))
                 score *= if (distance < 0.22f) 1.8f else 0.7f
             }
             if (score > bestScore) {
@@ -222,18 +237,15 @@ class VisionPipeline {
 
     private fun mergePose(points: List<PointF>, stamp: Long) {
         val dt = if (lastSeenAt == 0L) 0.033f else ((stamp - lastSeenAt) / 1000f).coerceIn(0.008f, 0.2f)
-        var visibilitySum = 0f
         points.forEachIndexed { index, point ->
-            val filter = filters.getOrPut(index) { OneEuroFilter() }
-            val dx = filter.filter(point.x, dt)
-            val dy = filters.getOrPut(index + 100) { OneEuroFilter() }.filter(point.y, dt)
-            lastLandmarks[index] = PointF(dx, dy)
-            visibilitySum += 1f
+            val fx = filters.getOrPut(index) { OneEuroFilter() }
+            val fy = filters.getOrPut(index + 100) { OneEuroFilter() }
+            lastLandmarks[index] = PointF(fx.filter(point.x, dt), fy.filter(point.y, dt))
         }
         val box = boundsOf(lastLandmarks)
         lastArea = box.width() * box.height()
         lastCentroid = PointF(box.centerX(), box.centerY())
-        lastConfidence = if (visibilitySum <= 0f) 0.6f else 0.72f
+        lastConfidence = 0.75f
         lastSeenAt = stamp
         genderHint = inferGender()
     }
@@ -246,10 +258,8 @@ class VisionPipeline {
                 (point.y + shift.y).coerceIn(-0.1f, 1.1f)
             )
         }
-        val elapsed = stamp - lastSeenAt
         lastConfidence = (lastConfidence * 0.96f).coerceAtLeast(0.15f)
         lastRoi = boundsOf(lastLandmarks)
-        if (elapsed > LOST_HOLD_MS) lastConfidence = 0f
     }
 
     private fun orderedLandmarks(): List<PointF> {
@@ -259,17 +269,14 @@ class VisionPipeline {
     }
 
     private fun inferGender(): Gender? {
-        val shoulder = OneEuroFilter.distance(
-            Pair(lastLandmarks[11]?.x ?: return genderHint, lastLandmarks[11]?.y ?: return genderHint),
-            Pair(lastLandmarks[12]?.x ?: return genderHint, lastLandmarks[12]?.y ?: return genderHint)
-        )
-        val hip = OneEuroFilter.distance(
-            Pair(lastLandmarks[23]?.x ?: return genderHint, lastLandmarks[23]?.y ?: return genderHint),
-            Pair(lastLandmarks[24]?.x ?: return genderHint, lastLandmarks[24]?.y ?: return genderHint)
-        )
+        val leftShoulder = lastLandmarks[11] ?: return genderHint
+        val rightShoulder = lastLandmarks[12] ?: return genderHint
+        val leftHip = lastLandmarks[23] ?: return genderHint
+        val rightHip = lastLandmarks[24] ?: return genderHint
+        val shoulder = OneEuroFilter.distance(Pair(leftShoulder.x, leftShoulder.y), Pair(rightShoulder.x, rightShoulder.y))
+        val hip = OneEuroFilter.distance(Pair(leftHip.x, leftHip.y), Pair(rightHip.x, rightHip.y))
         if (shoulder <= 0f || hip <= 0f) return genderHint
-        val ratio = shoulder / hip
-        return if (ratio > 1.13f) Gender.MALE else Gender.FEMALE
+        return if (shoulder / hip > 1.13f) Gender.MALE else Gender.FEMALE
     }
 
     // endregion
@@ -284,7 +291,7 @@ class VisionPipeline {
             image.close()
             val maskImage = result.categoryMask().orElse(null)
             val buffer: ByteBuffer? = maskImage?.getByteBuffer()
-            val classes = IntArray(ANALYSIS_SIZE * ANALYSIS_SIZE)
+            val classes = IntArray(ANALYSIS_W * ANALYSIS_H)
             if (buffer != null) {
                 for (i in classes.indices) {
                     classes[i] = if (i < buffer.limit()) (buffer.get(i).toInt() and 0xFF) else CLASS_BACKGROUND
@@ -297,19 +304,19 @@ class VisionPipeline {
     }
 
     private fun occluderMask(classes: IntArray?, present: Boolean): Bitmap {
-        val bitmap = Bitmap.createBitmap(MASK_SIZE, MASK_SIZE, Bitmap.Config.ARGB_8888)
+        val bitmap = Bitmap.createBitmap(MASK_W, MASK_H, Bitmap.Config.ARGB_8888)
         if (!present) return bitmap
         val canvas = Canvas(bitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         paint.color = Color.WHITE
         if (classes != null) {
-            val pixels = IntArray(MASK_SIZE * MASK_SIZE)
-            for (y in 0 until MASK_SIZE) {
-                for (x in 0 until MASK_SIZE) {
-                    val sx = (x * ANALYSIS_SIZE) / MASK_SIZE
-                    val sy = (y * ANALYSIS_SIZE) / MASK_SIZE
-                    val cls = classes[sy * ANALYSIS_SIZE + sx]
-                    pixels[y * MASK_SIZE + x] =
+            val pixels = IntArray(MASK_W * MASK_H)
+            for (y in 0 until MASK_H) {
+                for (x in 0 until MASK_W) {
+                    val sx = (x * ANALYSIS_W) / MASK_W
+                    val sy = (y * ANALYSIS_H) / MASK_H
+                    val cls = classes[sy * ANALYSIS_W + sx]
+                    pixels[y * MASK_W + x] =
                         if (cls == CLASS_HAIR || cls == CLASS_FACE_SKIN || cls == CLASS_ACCESSORY) {
                             Color.WHITE
                         } else {
@@ -317,11 +324,11 @@ class VisionPipeline {
                         }
                 }
             }
-            bitmap.setPixels(pixels, 0, MASK_SIZE, 0, 0, MASK_SIZE, MASK_SIZE)
+            bitmap.setPixels(pixels, 0, MASK_W, 0, 0, MASK_W, MASK_H)
         }
-        listOf(15, 16, 19, 20).forEach { index ->
+        listOf(15, 16, 17, 18, 19, 20).forEach { index ->
             val p = lastLandmarks[index] ?: return@forEach
-            canvas.drawCircle(p.x * MASK_SIZE, p.y * MASK_SIZE, 3.4f, paint)
+            canvas.drawCircle(p.x * MASK_W, p.y * MASK_H, 3.4f, paint)
         }
         return bitmap
     }
@@ -381,35 +388,33 @@ class VisionPipeline {
 
     // region bitmap helpers
 
+    /** Rotates the camera buffer upright and scales it to a 3:4 frame that matches the preview. */
     private fun uprightScaled(source: Bitmap, rotation: Int): Bitmap {
-        val longest = max(source.width, source.height)
-        val scale = ANALYSIS_SIZE.toFloat() / longest.toFloat()
-        val matrix = Matrix()
-        matrix.postRotate(rotation.toFloat())
-        if (scale < 1f) matrix.postScale(scale, scale)
-        val rotated = if (rotation == 0 && scale >= 1f) {
+        val rotated = if (rotation == 0) {
             source
         } else {
+            val matrix = Matrix()
+            matrix.postRotate(rotation.toFloat())
             Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
         }
-        if (rotated.width == ANALYSIS_SIZE && rotated.height == ANALYSIS_SIZE) return rotated
-        val square = Bitmap.createBitmap(ANALYSIS_SIZE, ANALYSIS_SIZE, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(square)
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-        val offsetX = (ANALYSIS_SIZE - rotated.width) / 2f
-        val offsetY = (ANALYSIS_SIZE - rotated.height) / 2f
-        canvas.drawBitmap(rotated, offsetX, offsetY, paint)
-        if (rotated !== source && rotated !== square) rotated.recycle()
-        return square
+        val scale = max(ANALYSIS_W.toFloat() / rotated.width, ANALYSIS_H.toFloat() / rotated.height)
+        val scaledW = (rotated.width * scale).toInt().coerceAtLeast(ANALYSIS_W)
+        val scaledH = (rotated.height * scale).toInt().coerceAtLeast(ANALYSIS_H)
+        val scaled = Bitmap.createScaledBitmap(rotated, scaledW, scaledH, true)
+        val left = (scaledW - ANALYSIS_W) / 2
+        val top = (scaledH - ANALYSIS_H) / 2
+        val out = Bitmap.createBitmap(scaled, left, top, ANALYSIS_W, ANALYSIS_H)
+        if (scaled !== out) scaled.recycle()
+        if (rotated !== source && rotated !== scaled) rotated.recycle()
+        return out
     }
 
     private fun lumaOf(bitmap: Bitmap): ByteArray {
-        val w = 32
-        val h = 32
-        val small = Bitmap.createScaledBitmap(bitmap, w, h, true)
-        val pixels = IntArray(w * h)
-        small.getPixels(pixels, 0, w, 0, 0, w, h)
-        val out = ByteArray(w * h)
+        val small = Bitmap.createScaledBitmap(bitmap, LUMA_W, LUMA_H, true)
+        val pixels = IntArray(LUMA_W * LUMA_H)
+        small.getPixels(pixels, 0, LUMA_W, 0, 0, LUMA_W, LUMA_H)
+        small.recycle()
+        val out = ByteArray(LUMA_W * LUMA_H)
         for (i in pixels.indices) {
             val c = pixels[i]
             val luma = (0.299f * Color.red(c) + 0.587f * Color.green(c) + 0.114f * Color.blue(c)).toInt()
@@ -421,23 +426,25 @@ class VisionPipeline {
     /** Cheap block match: returns the dominant frame-to-frame translation in normalized units. */
     private fun estimateShift(previous: ByteArray?, current: ByteArray): PointF {
         if (previous == null || previous.size != current.size) return PointF(0f, 0f)
-        val size = 11
-        val w = 32
-        val h = 32
+        val margin = 11
         var bestX = 0
         var bestY = 0
         var bestScore = Long.MAX_VALUE
         for (shiftY in -4..4) {
             for (shiftX in -4..4) {
                 var score = 0L
-                for (y in size until h - size step 4) {
-                    for (x in size until w - size step 4) {
+                var y = margin
+                while (y < LUMA_H - margin) {
+                    var x = margin
+                    while (x < LUMA_W - margin) {
                         val diff = abs(
-                            (current[y * w + x].toInt() and 0xFF) -
-                                (previous[(y + shiftY) * w + (x + shiftX)].toInt() and 0xFF)
+                            (current[y * LUMA_W + x].toInt() and 0xFF) -
+                                (previous[(y + shiftY) * LUMA_W + (x + shiftX)].toInt() and 0xFF)
                         )
                         score += diff.toLong()
+                        x += 4
                     }
+                    y += 4
                 }
                 if (score < bestScore) {
                     bestScore = score
@@ -446,10 +453,10 @@ class VisionPipeline {
                 }
             }
         }
-        return PointF(bestX / w.toFloat(), bestY / h.toFloat())
+        return PointF(bestX / LUMA_W.toFloat(), bestY / LUMA_H.toFloat())
     }
 
-    private fun boundsOf(points: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>): RectF {
+    private fun boundsOf(points: List<NormalizedLandmark>): RectF {
         var minX = 1f
         var minY = 1f
         var maxX = 0f
