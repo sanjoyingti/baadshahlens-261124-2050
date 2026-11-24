@@ -5,23 +5,30 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.PorterDuff
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Rational
+import android.util.Size
+import android.view.Display
 import android.view.Surface
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalCameraEffect
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.MeteringPointFactory
 import androidx.camera.core.Preview
 import androidx.camera.core.ResolutionSelector
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.ViewPort
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.effects.OverlayEffect
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
@@ -42,11 +49,13 @@ import com.aibuilt.baadshahlens.vision.VisionPipeline
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.math.max
 import kotlin.math.min
 
+@OptIn(ExperimentalCameraEffect::class)
 class CameraController(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner,
@@ -82,18 +91,19 @@ class CameraController(
     suspend fun bind(previewView: PreviewView, lensFacing: Int): String? {
         if (bound) return null
         if (!pipeline.isReady) return "Tracking models are not downloaded yet."
-        val cameraProvider = ProcessCameraProvider.getInstance(context).awaitProvider() ?: return "The camera could not start."
+        val cameraProvider = ProcessCameraProvider.getInstance(context).awaitProvider(mainExecutor)
+            ?: return "The camera could not start."
         provider = cameraProvider
 
-        val effectTargets = CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE or CameraEffect.IMAGE_CAPTURE
-        val overlayEffect = OverlayEffect(effectTargets, 2, handler, Consumer { it.printStackTrace() })
+        val targets = CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE or CameraEffect.IMAGE_CAPTURE
+        val overlayEffect = OverlayEffect(targets, 2, handler, Consumer { it.printStackTrace() })
         overlayEffect.setOnDrawListener { frame ->
             val latest = latestFrame
             val canvas = frame.canvas
             if (latest != null && overlayOn) {
-                renderer.render(canvas, latest, frame.rotationDegrees, strength, gender, ghostAlpha)
+                renderer.render(canvas, latest, uprightRotation(), strength, gender, ghostAlpha)
             } else {
-                canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
+                canvas.drawColor(0, PorterDuff.Mode.CLEAR)
             }
             true
         }
@@ -107,9 +117,9 @@ class CameraController(
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
-                        androidx.camera.core.resolutionselector.ResolutionStrategy(
-                            android.util.Size(640, 480),
-                            androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        ResolutionStrategy(
+                            Size(640, 480),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                         )
                     )
                     .build()
@@ -127,10 +137,9 @@ class CameraController(
             effect?.drawFrameAsync(stamp)
         }
 
-        val capture = ImageCapture.Builder()
+        imageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .build()
-        imageCapture = capture
 
         val recorder = Recorder.Builder()
             .setQualitySelector(
@@ -144,15 +153,13 @@ class CameraController(
         videoCapture = video
 
         val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
-        val viewPort = ViewPort.Builder(Rational(3, 4), rotation).build()
-
         val group = UseCaseGroup.Builder()
             .addUseCase(preview)
             .addUseCase(analysis)
-            .addUseCase(capture)
+            .addUseCase(imageCapture!!)
             .addUseCase(video)
             .addEffect(overlayEffect)
-            .setViewPort(viewPort)
+            .setViewPort(ViewPort.Builder(Rational(3, 4), rotation).build())
             .build()
 
         return runCatching {
@@ -195,43 +202,25 @@ class CameraController(
 
     fun hasTorch(): Boolean = camera?.cameraInfo?.hasFlashUnit() == true
 
-    fun setZoom(ratio: Float) {
+    fun zoomBy(factor: Float) {
         val info = camera?.cameraInfo ?: return
-        val zoom = info.zoomState.value ?: return
-        runCatching {
-            camera?.cameraControl?.setZoomRatio(ratio.coerceIn(zoom.minZoomRatio, min(zoom.maxZoomRatio, 6f)))
-        }
+        val state = info.zoomState.value ?: return
+        val target = (state.zoomRatio * factor).coerceIn(1f, min(state.maxZoomRatio, 6f))
+        runCatching { camera?.cameraControl?.setZoomRatio(target) }
     }
 
-    fun focus(x: Float, y: Float) {
+    fun focus(normalizedX: Float, normalizedY: Float) {
         val control = camera?.cameraControl ?: return
         runCatching {
-            val point = androidx.camera.core.MeteringPointFactory.createPoint(0f, 0f)
-            val factory = surfacFactory() ?: return
-            val meteringPoint = factory.createPoint(x, y)
-            control.startFocusAndMetering(FocusMeteringAction.Builder(meteringPoint).build())
+            val point = MeteringPointFactory.createPoint(
+                normalizedX.coerceIn(0.02f, 0.98f),
+                normalizedCoverY(normalizedY)
+            )
+            control.startFocusAndMetering(FocusMeteringAction.Builder(point).build())
         }
     }
 
-    private var pointFactory: androidx.camera.core.MeteringPointFactory? = null
-
-    fun attachMetering(width: Int, height: Int) {
-        pointFactory = androidx.camera.core.MeteringPointFactory.createPoint(0f, 0f).let {
-            androidx.camera.core.MeteringPointFactory(androidx.camera.core.CameraSelector.LENS_FACING_BACK)
-                .let { _ -> null }
-        }
-        pointFactory = if (width > 0 && height > 0) null else null
-        cropMetering = if (width > 0 && height > 0) {
-            androidx.camera.core.MeteringPointFactory(width, height)
-        } else {
-            null
-        }
-    }
-
-    private var cropMetering: androidx.camera.core.MeteringPointFactory? = null
-
-    private fun surfacFactory(): androidx.camera.core.MeteringPointFactory? =
-        cropMetering ?: androidx.camera.core.MeteringPointFactory(640, 480)
+    private fun normalizedCoverY(value: Float): Float = value.coerceIn(0.02f, 0.98f)
 
     fun captureStill(file: File, onDone: (Boolean) -> Unit) {
         val capture = imageCapture ?: return onDone(false)
@@ -245,8 +234,8 @@ class CameraController(
     fun startRecording(file: File, muted: Boolean, onMessage: (String) -> Unit): Boolean {
         val video = videoCapture ?: return false
         if (recording != null) return false
-        val freeBytes = file.parentFile?.usableSpace ?: 0L
-        if (freeBytes in 1 until 300L * 1024L * 1024L) {
+        val free = file.parentFile?.usableSpace ?: 0L
+        if (free in 1 until 300L * 1024L * 1024L) {
             onMessage("Storage is nearly full. A recording needs about 300 MB of room.")
             return false
         }
@@ -277,6 +266,7 @@ class CameraController(
     }
 
     fun thermalStatus(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
         val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return 0
         return runCatching { power.currentThermalStatus }.getOrDefault(0)
     }
@@ -286,19 +276,37 @@ class CameraController(
         return manager?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
     }
 
+    /** How many degrees the sensor buffer must turn to stand upright on screen. */
+    fun uprightRotation(): Int {
+        val info = camera?.cameraInfo ?: return 0
+        val displayDegrees = when (displayRotation()) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        val sensor = info.sensorRotationDegrees
+        return if (info.lensFacing == CameraSelector.LENS_FACING_FRONT) {
+            (sensor + displayDegrees) % 360
+        } else {
+            (sensor - displayDegrees + 360) % 360
+        }
+    }
+
     companion object {
+
         fun sharpness(bitmap: Bitmap): Double {
             val small = Bitmap.createScaledBitmap(bitmap, 96, 96, true)
             val w = small.width
             val h = small.height
             val pixels = IntArray(w * h)
-            small.getPixels(pixels, 0, w, 0, 0, w, h)
+            small.getPixels(values = pixels, offset = 0, stride = w, x = 0, y = 0, width = w, height = h)
             val luma = DoubleArray(w * h)
             for (i in pixels.indices) {
                 val c = pixels[i]
-                luma[i] = (0.299 * android.graphics.Color.red(c) +
+                luma[i] = 0.299 * android.graphics.Color.red(c) +
                     0.587 * android.graphics.Color.green(c) +
-                    0.114 * android.graphics.Color.blue(c))
+                    0.114 * android.graphics.Color.blue(c)
             }
             var sum = 0.0
             var sumSq = 0.0
@@ -330,11 +338,8 @@ class CameraController(
     }
 }
 
-private const val Display = android.view.Display::class
-
-private suspend fun ListenableFuture<ProcessCameraProvider>.awaitProvider(): ProcessCameraProvider? =
-    suspendCancellableCoroutine { continuation ->
-        addListener({
-            continuation.resume(runCatching { get() }.getOrNull())
-        }, ContextCompat.getMainExecutorSafe())
-    }
+private suspend fun ListenableFuture<ProcessCameraProvider>.awaitProvider(
+    executor: Executor
+): ProcessCameraProvider? = suspendCancellableCoroutine { continuation ->
+    addListener({ continuation.resume(runCatching { get() }.getOrNull()) }, executor)
+}

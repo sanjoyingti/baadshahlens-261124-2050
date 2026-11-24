@@ -2,6 +2,7 @@ package com.aibuilt.baadshahlens.data
 
 import android.content.Context
 import androidx.room.Room
+import com.aibuilt.baadshahlens.BaadshahApp
 import com.aibuilt.baadshahlens.data.cloud.ReplicateClient
 import com.aibuilt.baadshahlens.data.db.AppDatabase
 import com.aibuilt.baadshahlens.data.db.GalleryRepository
@@ -14,6 +15,8 @@ import java.io.File
 class AppContainer(context: Context) {
 
     private val app = context.applicationContext
+
+    val context: Context get() = app
 
     val settings = SettingsRepository(app)
 
@@ -37,3 +40,5 @@ class AppContainer(context: Context) {
     val cloudDir: File get() = File(app.filesDir, "cloud").also { it.mkdirs() }
     val videosDir: File get() = File(app.filesDir, "videos").also { it.mkdirs() }
 }
+
+fun Context.appContainer(): AppContainer = (applicationContext as BaadshahApp).container
