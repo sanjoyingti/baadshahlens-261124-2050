@@ -3,9 +3,6 @@ package com.aibuilt.baadshahlens.ui.screens
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Color as AColor
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -14,7 +11,6 @@ import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
-import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -22,12 +18,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -42,32 +36,37 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Female
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
-import androidx.compose.material.icons.fainted.GridOff
+import androidx.compose.material.icons.filled.GridOff
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Male
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -80,24 +79,22 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.aibuilt.baadshahlens.camera.CameraController
 import com.aibuilt.baadshahlens.camera.HardwareKeys
 import com.aibuilt.baadshahlens.camera.KeyPhase
+import com.aibuilt.baadshahlens.data.AppContainer
 import com.aibuilt.baadshahlens.data.appContainer
 import com.aibuilt.baadshahlens.data.settings.Gender
 import com.aibuilt.baadshahlens.data.settings.QualityTier
 import com.aibuilt.baadshahlens.ui.common.ErrorStrip
 import com.aibuilt.baadshahlens.ui.common.TierPicker
 import com.aibuilt.baadshahlens.ui.common.VmFactory
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlin.coroutines.resume
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 
 @Composable
 fun CameraScreen(
     onBack: () -> Unit,
     onOpenGallery: () -> Unit,
+    onOpenRecord: () -> Unit,
     onOpenResult: (String, String, String, String, String) -> Unit
 ) {
     val context = LocalContext.current
@@ -105,7 +102,6 @@ fun CameraScreen(
     val vm: CameraViewModel = viewModel(factory = VmFactory { CameraViewModel(container) })
     val state by vm.state.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
     val progress by container.models.progress.collectAsStateWithLifecycle()
     val modelsReady = remember(progress) { container.models.allReady() }
 
@@ -160,6 +156,12 @@ fun CameraScreen(
         }
     }
 
+    LaunchedEffect(modelsReady) {
+        if (modelsReady) {
+            controller.prepare(container.models.fileFor("pose"), container.models.fileFor("seg"))
+        }
+    }
+
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -183,7 +185,7 @@ fun CameraScreen(
         if (error != null) vm.setError(error)
     }
 
-    LaunchedEffect(state.strength, state.gender, state.overlayOn, state.ghost, state.cleanVideo) {
+    LaunchedEffect(state.strength, state.gender, state.overlayOn, state.ghost) {
         controller.strength = state.strength
         controller.gender = state.gender
         controller.overlayOn = state.overlayOn
@@ -207,7 +209,8 @@ fun CameraScreen(
             override fun onSensorChanged(event: SensorEvent) {
                 vm.setTilt(event.values[2])
             }
-            override fun onAccuracyChanged(event: Sensor?, accuracy: Int) = Unit
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
         }
         manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_UI)
         try {
@@ -225,13 +228,15 @@ fun CameraScreen(
                 KeyPhase.REPEAT -> {
                     if (pressed) {
                         pressed = false
-                        if (!controller.isRecording) startVideo(context, controller, vm, state.muted, state.cleanVideo)
+                        if (!controller.isRecording) {
+                            startVideo(context, controller, vm, state.muted, state.cleanVideo)
+                        }
                     }
                 }
                 KeyPhase.UP -> {
                     if (pressed) {
                         pressed = false
-                        shoot(context, container, controller, vm, onOpenResult)
+                        shoot(controller, vm, onOpenResult)
                     } else if (controller.isRecording) {
                         controller.stopRecording()
                     }
@@ -277,8 +282,8 @@ fun CameraScreen(
                     val stepX = size.width / 3f
                     val stepY = size.height / 3f
                     for (i in 1..2) {
-                        drawLine(Color.White.copy(alpha = 0.32f), androidx.compose.ui.geometry.Offset(stepX * i, 0f), androidx.compose.ui.geometry.Offset(stepX * i, size.height), 1f)
-                        drawLine(Color.White.copy(alpha = 0.32f), androidx.compose.ui.geometry.Offset(0f, stepY * i), androidx.compose.ui.geometry.Offset(size.width, stepY * i), 1f)
+                        drawLine(Color.White.copy(alpha = 0.32f), Offset(stepX * i, 0f), Offset(stepX * i, size.height), 1f)
+                        drawLine(Color.White.copy(alpha = 0.32f), Offset(0f, stepY * i), Offset(size.width, stepY * i), 1f)
                     }
                 }
             }
@@ -290,15 +295,15 @@ fun CameraScreen(
                     val stroke = Stroke(width = 3f)
                     drawRoundRect(
                         color = Color(0xFFF2B33D).copy(alpha = 0.85f),
-                        topLeft = androidx.compose.ui.geometry.Offset(w * 0.28f, h * 0.14f),
-                        size = androidx.compose.ui.geometry.Size(w * 0.44f, h * 0.68f),
-                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(26f, 26f),
+                        topLeft = Offset(w * 0.28f, h * 0.14f),
+                        size = Size(w * 0.44f, h * 0.68f),
+                        cornerRadius = CornerRadius(26f, 26f),
                         style = stroke
                     )
                     drawCircle(
                         color = Color(0xFFF2B33D).copy(alpha = 0.85f),
                         radius = w * 0.075f,
-                        center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.22f),
+                        center = Offset(w * 0.5f, h * 0.22f),
                         style = stroke
                     )
                 }
@@ -315,13 +320,13 @@ fun CameraScreen(
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(12.dp))
-                    androidx.compose.material3.Button(onClick = {
+                    Button(onClick = {
                         permissionLauncher.launch(
                             arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
                         )
                     }) { Text("Allow camera") }
                     Spacer(Modifier.height(6.dp))
-                    androidx.compose.material3.TextButton(onClick = onBack) { Text("Open settings instead") }
+                    TextButton(onClick = onBack) { Text("Open settings instead") }
                 }
             }
         }
@@ -333,7 +338,7 @@ fun CameraScreen(
                     Spacer(Modifier.height(6.dp))
                     Text("Open Settings → Downloads to fetch them.", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(10.dp))
-                    androidx.compose.material3.Button(onClick = onBack) { Text("Settings") }
+                    Button(onClick = onBack) { Text("Settings") }
                 }
             }
         }
@@ -345,15 +350,15 @@ fun CameraScreen(
         }
 
         if (state.glasses) {
-            GlassesChrome(state = state, onExit = { vm.toggleGlasses() }, onTimedOut = { vm.markHintShown() })
+            GlassesChrome(onExit = { vm.toggleGlasses() }, hintShown = state.hintShown, onTimedOut = { vm.markHintShown() })
         } else {
             NormalChrome(
                 state = state,
-                lensFacing = lensFacing,
                 torch = torch,
                 modelsReady = modelsReady,
                 onSettings = onBack,
                 onGallery = onOpenGallery,
+                onRecord = onOpenRecord,
                 onFlip = {
                     torch = false
                     controller.setTorch(false)
@@ -373,7 +378,7 @@ fun CameraScreen(
                 onStrength = { vm.setStrength(it) },
                 onGuideDismiss = { vm.dismissGuide() },
                 onGlasses = { vm.toggleGlasses() },
-                onShutter = { shoot(context, container, controller, vm, onOpenResult) }
+                onShutter = { shoot(controller, vm, onOpenResult) }
             )
         }
 
@@ -388,11 +393,7 @@ fun CameraScreen(
             ) {
                 Box(Modifier.size(9.dp).background(Color(0xFFE2564C), CircleShape))
                 Spacer(Modifier.width(8.dp))
-                Text(
-                    text = vm.formatTime(),
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelSmall
-                )
+                Text(text = vm.formatTime(), color = Color.White, style = MaterialTheme.typography.labelSmall)
             }
         }
     }
@@ -405,37 +406,30 @@ private fun startVideo(
     muted: Boolean,
     clean: Boolean
 ) {
-    val file = File(context.filesDir, "videos").also { it.mkdirs() }
-        .let { File(it, "clip_${System.currentTimeMillis()}.mp4") }
+    val dir = File(context.filesDir, "videos").also { it.mkdirs() }
+    val file = File(dir, "clip_${System.currentTimeMillis()}.mp4")
     controller.overlayOn = !clean
     vm.beginRecord(file)
     val started = controller.startRecording(file, muted) { vm.setError(it) }
     if (!started) vm.abortRecord()
 }
 
-private fun shoot(
-    context: Context,
-    container: com.aibuilt.baadshahlens.data.AppContainer,
-    controller: CameraController,
-    vm: CameraViewModel,
-    onOpenResult: (String, String, String, String, String) -> Unit
-) {
+private fun shoot(controller: CameraController, vm: CameraViewModel, onOpenResult: (String, String, String, String, String) -> Unit) {
     if (controller.isRecording) {
         controller.stopRecording()
         return
     }
     vm.shoot(controller) { before, after, mask, occ, tier -> onOpenResult(before, after, mask, occ, tier) }
-    vm.setErrorIfEmpty()
 }
 
 @Composable
 private fun NormalChrome(
     state: CameraUiState,
-    lensFacing: Int,
     torch: Boolean,
     modelsReady: Boolean,
     onSettings: () -> Unit,
     onGallery: () -> Unit,
+    onRecord: () -> Unit,
     onFlip: () -> Unit,
     onTorch: () -> Unit,
     onGrid: () -> Unit,
@@ -453,21 +447,16 @@ private fun NormalChrome(
         ) {
             IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings") }
             Spacer(Modifier.width(2.dp))
-            Text(
-                "Baadshah Lens",
-                style = MaterialTheme.typography.titleMedium,
-                color = Color(0xFFF2B33D)
-            )
+            Text("Baadshah Lens", style = MaterialTheme.typography.titleMedium, color = Color(0xFFF2B33D))
             Spacer(Modifier.weight(1f))
             IconButton(onClick = onTorch, enabled = modelsReady) {
                 Icon(if (torch) Icons.Filled.FlashOn else Icons.Filled.FlashOff, "Torch")
             }
-            IconButton(onClick = onGrid) { Icon(if (state.grid) Icons.Filled.GridOn else Icons.Filled.GridOff, "Grid") }
+            IconButton(onClick = onGrid) {
+                Icon(if (state.grid) Icons.Filled.GridOn else Icons.Filled.GridOff, "Grid")
+            }
             IconButton(onClick = onGender) {
-                Icon(
-                    if (state.gender == Gender.MALE) Icons.Filled.Male else Icons.Filled.Female,
-                    "Body shape"
-                )
+                Icon(if (state.gender == Gender.MALE) Icons.Filled.Male else Icons.Filled.Female, "Body shape")
             }
             IconButton(onClick = onFlip) { Icon(Icons.Filled.Cameraswitch, "Switch camera") }
         }
@@ -508,7 +497,7 @@ private fun NormalChrome(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Strength", style = MaterialTheme.typography.labelSmall)
                 Slider(
-                    value = state.strength,
+                    value = state.strength.coerceIn(0.1f, 1f),
                     onValueChange = onStrength,
                     valueRange = 0.1f..1f,
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
@@ -520,6 +509,7 @@ private fun NormalChrome(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = onGallery) { Icon(Icons.Filled.PhotoLibrary, "Gallery") }
+                IconButton(onClick = onRecord) { Icon(Icons.Filled.Videocam, "Record") }
                 Spacer(Modifier.weight(1f))
                 Box(
                     Modifier
@@ -530,18 +520,15 @@ private fun NormalChrome(
                         .pointerInput(Unit) { detectTapGestures { onShutter() } }
                 )
                 Spacer(Modifier.weight(1f))
-                AssistChip(
-                    onClick = onGlasses,
-                    label = { Text("Glasses") }
-                )
+                AssistChip(onClick = onGlasses, label = { Text("Glasses") })
             }
         }
     }
 }
 
 @Composable
-private fun GlassesChrome(state: CameraUiState, onExit: () -> Unit, onTimedOut: () -> Unit) {
-    var hintVisible by remember { mutableStateOf(!state.hintShown) }
+private fun GlassesChrome(onExit: () -> Unit, hintShown: Boolean, onTimedOut: () -> Unit) {
+    var hintVisible by remember { mutableStateOf(!hintShown) }
     LaunchedEffect(Unit) {
         if (hintVisible) {
             delay(5000)
@@ -568,4 +555,5 @@ private fun GlassesChrome(state: CameraUiState, onExit: () -> Unit, onTimedOut: 
     }
 }
 
-private fun androidx.compose.ui.input.pointer.PointerInputScope.pointerInput() = Unit
+@Suppress("unused")
+private val screenUnusedContainer: AppContainer? = null

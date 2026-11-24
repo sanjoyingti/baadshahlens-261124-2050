@@ -68,6 +68,7 @@ fun PikaApp() {
                 CameraScreen(
                     onBack = { nav.navigate(Route.Settings.path) },
                     onOpenGallery = { nav.navigate(Route.Gallery.path) },
+                    onOpenRecord = { nav.navigate(Route.Record.path) },
                     onOpenResult = { before, after, mask, occ, tier ->
                         nav.navigate(Route.Result.of(before, after, mask, occ, tier))
                     }
@@ -75,7 +76,10 @@ fun PikaApp() {
             }
 
             composable(Route.Record.path) {
-                RecordScreen(onBack = { nav.navigate(Route.Camera.path) })
+                RecordScreen(
+                    onBack = { nav.popBackStack() },
+                    onOpenGallery = { nav.navigate(Route.Gallery.path) }
+                )
             }
 
             composable(Route.Gallery.path) {

@@ -7,10 +7,9 @@ import androidx.lifecycle.viewModelScope
 import com.aibuilt.baadshahlens.camera.CameraController
 import com.aibuilt.baadshahlens.data.AppContainer
 import com.aibuilt.baadshahlens.data.db.MediaKind
-import com.aibuilt.baadshahlens.data.settings.AppSettings
 import com.aibuilt.baadshahlens.data.settings.Gender
 import com.aibuilt.baadshahlens.data.settings.QualityTier
-import com.aibuilt.baadshahlens.vision.OnDeviceInpainter
+import com.aibuilt.baadshahlens.data.cloud.CloudResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,7 +20,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import kotlin.coroutines.resume
+import kotlin.math.max
+import kotlin.random.Random
 
 data class CameraUiState(
     val tier: QualityTier = QualityTier.FAST,
@@ -42,14 +44,6 @@ data class CameraUiState(
     val recordSeconds: Int = 0,
     val recordBytes: Long = 0L,
     val error: String? = null
-)
-
-private data class CaptureResult(
-    val before: String,
-    val after: String,
-    val mask: String,
-    val occ: String,
-    val tier: String
 )
 
 class CameraViewModel(private val container: AppContainer) : ViewModel() {
@@ -90,6 +84,8 @@ class CameraViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun toggleGrid() = _state.update { it.copy(grid = !it.grid) }
+
+    fun toggleMute() = _state.update { it.copy(muted = !it.muted) }
 
     fun setTilt(z: Float) {
         _state.update { it.copy(ghost = if (z < 2.6f) 0.12f else 1f) }
@@ -140,15 +136,23 @@ class CameraViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun setStrength(value: Float) {
+        val tier = _state.value.tier
         _state.update { it.copy(strength = value) }
-        viewModelScope.launch { container.settings.setStrength(_state.value.tier, value) }
+        viewModelScope.launch { container.settings.setStrength(tier, value) }
     }
 
-    fun toggleMute() = _state.update { it.copy(muted = !it.muted) }
+    fun formatTime(): String {
+        val total = _state.value.recordSeconds
+        val minutes = total / 60
+        val seconds = total % 60
+        return "%02d:%02d".format(minutes, seconds)
+    }
+
+    // region recording
 
     fun beginRecord(file: File) {
         recordFile = file
-        _state.update { it.copy(recording = true, recordSeconds = 0, recordBytes = 0L) }
+        _state.update { it.copy(recording = true, recordSeconds = 0, recordBytes = 0L, error = null) }
     }
 
     fun abortRecord() {
@@ -158,119 +162,195 @@ class CameraViewModel(private val container: AppContainer) : ViewModel() {
 
     fun tickRecord() {
         val file = recordFile ?: return
-        _state.update {
-            it.copy(recordSeconds = it.recordSeconds + 1, recordBytes = file.length())
-        }
-    }
-
-    fun formatTime(): String {
-        val s = _state.value.recordSeconds
-        return "%02d:%02d".format(s / 60, s % 60)
+        _state.update { it.copy(recordSeconds = it.recordSeconds + 1, recordBytes = file.length()) }
     }
 
     fun onRecordEvent(event: VideoRecordEvent) {
         if (event !is VideoRecordEvent.Finalize) return
         val file = recordFile
-        val failed = event.hasError() && file?.length() ?: 0L < 2000L
-        _state.update { it.copy(recording = false) }
         recordFile = null
-        if (failed || file == null) {
-            setError("The recording could not be saved. Free some space and try again.")
+        _state.update { it.copy(recording = false) }
+        if (event.hasError()) {
             file?.delete()
+            setError("The recording stopped with an error (code ${event.error}).")
             return
         }
-        viewModelScope.launch(Dispatchers.IO) {
-            container.gallery.add(file.absolutePath, MediaKind.VIDEO, true)
+        if (file != null && file.exists() && file.length() > 1024) {
+            viewModelScope.launch(Dispatchers.IO) {
+                container.gallery.add(file.absolutePath, MediaKind.VIDEO, generated = true)
+            }
         }
     }
 
-    fun shoot(
-        controller: CameraController,
-        onDone: (String, String, String, String, String) -> Unit
-    ) {
-        if (_state.value.busy) return
+    // endregion
+
+    // region shutter
+
+    fun shoot(controller: CameraController, onResult: (String, String, String, String, String) -> Unit) {
+        if (_state.value.busy || _state.value.recording) return
         _state.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
-            val result = runCatching { capture(controller) }.getOrNull()
-            _state.update { it.copy(busy = false) }
-            if (result == null) {
-                setError("The photo could not be taken. Hold still and try again.")
-                return@launch
+            try {
+                val tier = _state.value.tier
+                val gender = _state.value.gender
+                val strength = _state.value.strength
+                val frame = controller.latestFrame
+
+                val candidates = mutableListOf<File>()
+                var best: File? = null
+                var bestScore = -1.0
+                repeat(5) { index ->
+                    if (index > 0) delay(80)
+                    val file = container.gallery.newStillFile()
+                    val ok = captureTo(controller, file)
+                    if (ok && file.length() > 512) {
+                        candidates += file
+                        val probe = withContext(Dispatchers.Default) { CameraController.loadScaled(file, 256) }
+                        val score = probe?.let { CameraController.sharpness(it) } ?: 0.0
+                        probe?.recycle()
+                        if (score > bestScore) {
+                            bestScore = score
+                            best = file
+                        }
+                    } else {
+                        file.delete()
+                    }
+                }
+                val raw = best
+                if (raw == null) {
+                    _state.update { it.copy(busy = false, error = "The shutter did not fire. Try once more.") }
+                    return@launch
+                }
+                candidates.filter { it.absolutePath != raw.absolutePath }.forEach { it.delete() }
+
+                val composedFile = File(container.stillsDir, "fill_${System.currentTimeMillis()}.jpg")
+                val maskFile = File(container.stillsDir, "mask_${System.currentTimeMillis()}.png")
+                val occFile = File(container.stillsDir, "occ_${System.currentTimeMillis()}.png")
+
+                val built = withContext(Dispatchers.Default) {
+                    val photo = CameraController.loadScaled(raw, 1600)
+                    if (photo == null) return@withContext false
+                    val composed = if (frame != null) {
+                        controller.renderer.composeStill(photo, frame, strength, gender)
+                    } else {
+                        photo.copy(Bitmap.Config.ARGB_8888, true)
+                    }
+                    val saved = saveBitmap(composed, composedFile, Bitmap.CompressFormat.JPEG, 92)
+                    if (frame != null) {
+                        val mask = controller.renderer.renderMask(frame, composed.width, composed.height, 0)
+                        saveBitmap(mask, maskFile, Bitmap.CompressFormat.PNG, 100)
+                        mask.recycle()
+                        val occ = Bitmap.createScaledBitmap(frame.occluders, composed.width, composed.height, true)
+                        saveBitmap(occ, occFile, Bitmap.CompressFormat.PNG, 100)
+                        occ.recycle()
+                    }
+                    composed.recycle()
+                    photo.recycle()
+                    saved
+                }
+                if (built) {
+                    container.gallery.add(raw.absolutePath, MediaKind.STILL, generated = false)
+                }
+
+                var afterPath = composedFile.absolutePath
+                if (tier == QualityTier.BEST && built && maskFile.exists()) {
+                    val cloud = runCloud(controller, raw, maskFile, occFile, strength)
+                    if (cloud != null) afterPath = cloud else {
+                        _state.update {
+                            it.copy(
+                                error = "Cloud rerender failed. Your on-phone result is kept."
+                            )
+                        }
+                    }
+                }
+
+                _state.update { it.copy(busy = false) }
+                onResult(raw.absolutePath, afterPath, maskFile.absolutePath, occFile.absolutePath, tier.name)
+            } catch (t: Throwable) {
+                _state.update { it.copy(busy = false, error = t.message ?: "The shot failed.") }
             }
-            onDone(result.before, result.after, result.mask, result.occ, result.tier)
         }
     }
 
-    private suspend fun capture(controller: CameraController): CaptureResult? = withContext(Dispatchers.Default) {
-        val frame = controller.latestFrame ?: return@withContext null
-        val burstDir = File(container.context.cacheDir, "burst").also { it.mkdirs() }
-        val files = mutableListOf<File>()
-        repeat(5) { index ->
-            val file = File(burstDir, "b_${System.currentTimeMillis()}_$index.jpg")
-            val ok = suspendCancellableCoroutine { continuation ->
-                controller.captureStill(file) { if (continuation.isActive) continuation.resume(it) }
-            }
-            if (ok) files += file
-            delay(60)
-        }
-        if (files.isEmpty()) return@withContext null
-
-        var best: File? = null
-        var bestScore = -1.0
-        for (file in files) {
-            val sample = CameraController.loadScaled(file, 400)
-            val score = sample?.let { CameraController.sharpness(it) } ?: -1.0
-            sample?.recycle()
-            if (score > bestScore) {
-                bestScore = score
-                best = file
-            }
-        }
-        files.filter { it != best }.forEach { it.delete() }
-        val chosen = best ?: return@withContext null
-
-        val photo = CameraController.loadScaled(chosen, 1024) ?: return@withContext null
-        val gender = _state.value.gender
-        val strength = _state.value.strength
-
-        val composed = controller.renderer.composeStill(photo, frame, strength, gender)
-        val refined = OnDeviceInpainter.refine(
-            composed,
-            controller.renderer.renderMask(frame, composed.width, composed.height, controller.uprightRotation()),
-            strength.hashCode(),
-            strength
+    private suspend fun runCloud(
+        controller: CameraController,
+        raw: File,
+        maskFile: File,
+        occFile: File,
+        strength: Float
+    ): String? {
+        val settings = container.settings.flow.let { null } ?: null
+        val input = withContext(Dispatchers.Default) {
+            val bitmap = CameraController.loadScaled(raw, 1024) ?: return@withContext null
+            val bytes = java.io.ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 92, bytes)
+            bitmap.recycle()
+            bytes.toByteArray()
+        } ?: return null
+        val maskBytes = runCatching { maskFile.readBytes() }.getOrNull() ?: return null
+        val result = container.cloud.inpaint(
+            image = input,
+            mask = maskBytes,
+            prompt = "naked human body, natural skin tone, soft studio light, photographic",
+            stronger = strength,
+            seed = Random.nextLong(1, 1_000_000),
+            resolution = 1024
         )
-        val beforeFile = container.gallery.newStillFile("before")
-        val afterFile = File(container.stillsDir, "after_${System.currentTimeMillis()}.png")
-        val maskFile = File(container.stillsDir, "mask_${System.currentTimeMillis()}.png")
-        val occFile = File(container.stillsDir, "occ_${System.currentTimeMillis()}.png")
-
-        beforeFile.outputStream().use { photo.compress(Bitmap.CompressFormat.JPEG, 92, it) }
-        afterFile.outputStream().use { refined.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        maskFile.outputStream().use {
-            controller.renderer.renderMask(frame, refined.width, refined.height, controller.selfieRotation())
-                .compress(Bitmap.CompressFormat.PNG, 100, it)
+        when (result) {
+            is CloudResult.Failure -> {
+                setError(result.message)
+                return null
+            }
+            is CloudResult.Success -> {
+                if (!container.cloud.hasOwnToken()) {
+                    viewModelScope.launch { container.settings.bumpDemoShots() }
+                }
+                val file = File(container.cloudDir, "cloud_${System.currentTimeMillis()}.jpg")
+                val ok = withContext(Dispatchers.Default) {
+                    val generated = runCatching {
+                        android.graphics.BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.size)
+                    }.getOrNull() ?: return@withContext false
+                    val original = CameraController.loadScaled(raw, 1600)
+                    val occ = runCatching { android.graphics.BitmapFactory.decodeFile(occFile.absolutePath) }.getOrNull()
+                    val blended = if (original != null && occ != null) {
+                        controller.renderer.blendBack(generated, original, occ)
+                    } else {
+                        generated
+                    }
+                    val saved = saveBitmap(blended, file, Bitmap.CompressFormat.JPEG, 94)
+                    if (blended !== generated) blended.recycle()
+                    generated.recycle()
+                    original?.recycle()
+                    occ?.recycle()
+                    saved
+                }
+                if (!ok) return null
+                container.gallery.add(file.absolutePath, MediaKind.STILL, generated = true)
+                return file.absolutePath
+            }
         }
-        occFile.outputStream().use {
-            Bitmap.createScaledBitmap(frame.occluders, refined.width, refined.height, true)
-                .compress(Bitmap.CompressFormat.PNG, 100, it)
-        }
-
-        container.gallery.add(beforeFile.absolutePath, MediaKind.STILL, false)
-        container.gallery.add(afterFile.absolutePath, MediaKind.STILL, true)
-
-        composed.recycle()
-        if (refined !== composed) refined.recycle()
-        photo.recycle()
-
-        CaptureResult(
-            before = beforeFile.absolutePath,
-            after = afterFile.absolutePath,
-            mask = maskFile.absolutePath,
-            occ = occFile.absolutePath,
-            tier = _state.value.tier.name
-        )
     }
 
-    fun savedSettings(): AppSettings = AppSettings()
+    private suspend fun captureTo(controller: CameraController, file: File): Boolean =
+        suspendCancellableCoroutine { continuation ->
+            controller.captureStill(file) { ok -> if (continuation.isActive) continuation.resume(ok) }
+        }
+
+    private fun saveBitmap(bitmap: Bitmap, file: File, format: Bitmap.CompressFormat, quality: Int): Boolean =
+        runCatching {
+            file.parentFile?.mkdirs()
+            FileOutputStream(file).use { stream -> bitmap.compress(format, quality, stream) }
+        }.getOrDefault(false)
+
+    override fun onCleared() {
+        super.onCleared()
+        val file = recordFile
+        if (file != null && file.exists() && file.length() > 1024) {
+            // give the event loop a moment through the container repository
+        }
+        @Suppress("UNUSED_EXPRESSION")
+        max(1, 1)
+    }
+
+    // endregion
 }

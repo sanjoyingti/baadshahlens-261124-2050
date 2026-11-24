@@ -142,50 +142,54 @@ class VisionPipeline {
         }
         val rotation = proxy.imageInfo.rotationDegrees
         return try {
-            val source = proxy.toBitmap()
-            val scaled = uprightScaled(source, rotation)
-            if (source !== scaled) source.recycle()
-            val stamp = System.currentTimeMillis()
-            val luma = lumaOf(scaled)
-            val shift = estimateShift(previousLuma, luma)
-            previousLuma = luma
+            val raw = rgbaToBitmap(proxy)
+            if (raw == null) {
+                null
+            } else {
+                val scaled = uprightScaled(raw, rotation)
+                if (scaled !== raw) raw.recycle()
+                val stamp = System.currentTimeMillis()
+                val luma = lumaOf(scaled)
+                val shift = estimateShift(previousLuma, luma)
+                previousLuma = luma
 
-            val runPose = frameCounter % POSE_EVERY == 0 || lastLandmarks.isEmpty()
-            frameCounter++
+                val runPose = frameCounter % POSE_EVERY == 0 || lastLandmarks.isEmpty()
+                frameCounter++
 
-            if (runPose) {
-                val found = detectPose(scaled, stamp)
-                if (found != null) {
-                    mergePose(found, stamp)
-                } else if (lastLandmarks.isNotEmpty() && stamp - lastSeenAt < LOST_HOLD_MS) {
+                if (runPose) {
+                    val found = detectPose(scaled, stamp)
+                    if (found != null) {
+                        mergePose(found, stamp)
+                    } else if (lastLandmarks.isNotEmpty() && stamp - lastSeenAt < LOST_HOLD_MS) {
+                        carry(shift, stamp)
+                    } else {
+                        lastLandmarks.clear()
+                        lastRoi = null
+                        lastConfidence = 0f
+                        lastArea = 0f
+                    }
+                } else if (lastLandmarks.isNotEmpty()) {
                     carry(shift, stamp)
-                } else {
-                    lastLandmarks.clear()
-                    lastRoi = null
-                    lastConfidence = 0f
-                    lastArea = 0f
                 }
-            } else if (lastLandmarks.isNotEmpty()) {
-                carry(shift, stamp)
+
+                val present = lastLandmarks.isNotEmpty() && stamp - lastSeenAt < 400
+                val confidence = if (present) lastConfidence else 0f
+                val skin = sampleSkin(scaled, present)
+                val classes = if (present) segment(scaled) else null
+                val occluders = occluderMask(classes, present)
+
+                Frame(
+                    bitmap = scaled,
+                    landmarks = orderedLandmarks(),
+                    present = present,
+                    confidence = confidence,
+                    ageMs = if (present) 0 else stamp - lastSeenAt,
+                    area = lastArea,
+                    classes = classes ?: IntArray(ANALYSIS_W * ANALYSIS_H),
+                    occluders = occluders,
+                    skin = skin
+                )
             }
-
-            val present = lastLandmarks.isNotEmpty() && stamp - lastSeenAt < 400
-            val confidence = if (present) lastConfidence else 0f
-            val skin = sampleSkin(scaled, present)
-            val classes = if (present) segment(scaled) else null
-            val occluders = occluderMask(classes, present)
-
-            Frame(
-                bitmap = scaled,
-                landmarks = orderedLandmarks(),
-                present = present,
-                confidence = confidence,
-                ageMs = if (present) 0 else stamp - lastSeenAt,
-                area = lastArea,
-                classes = classes ?: IntArray(ANALYSIS_W * ANALYSIS_H),
-                occluders = occluders,
-                skin = skin
-            )
         } catch (t: Throwable) {
             Log.w("VisionPipeline", "frame failed", t)
             null
@@ -387,6 +391,42 @@ class VisionPipeline {
     // endregion
 
     // region bitmap helpers
+
+    /** Copies the RGBA analysis buffer into a bitmap without any helper extensions. */
+    private fun rgbaToBitmap(proxy: ImageProxy): Bitmap? {
+        val plane = proxy.planes.firstOrNull() ?: return null
+        val width = proxy.width
+        val height = proxy.height
+        if (width <= 0 || height <= 0) return null
+        val buffer = plane.buffer
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+        if (rowStride <= 0 || pixelStride <= 0) return null
+        val row = ByteArray(rowStride)
+        val pixels = IntArray(width * height)
+        for (y in 0 until height) {
+            val offset = y * rowStride
+            if (offset >= buffer.limit()) break
+            buffer.position(offset)
+            val count = min(rowStride, buffer.remaining())
+            if (count <= 0) break
+            buffer.get(row, 0, count)
+            var index = 0
+            for (x in 0 until width) {
+                if (index + 3 < count) {
+                    val r = row[index].toInt() and 0xFF
+                    val g = row[index + 1].toInt() and 0xFF
+                    val b = row[index + 2].toInt() and 0xFF
+                    val a = row[index + 3].toInt() and 0xFF
+                    pixels[y * width + x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                }
+                index += pixelStride
+            }
+        }
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+        return bitmap
+    }
 
     /** Rotates the camera buffer upright and scales it to a 3:4 frame that matches the preview. */
     private fun uprightScaled(source: Bitmap, rotation: Int): Bitmap {

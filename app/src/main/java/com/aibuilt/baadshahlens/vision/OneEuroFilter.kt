@@ -42,11 +42,6 @@ class OneEuroFilter(
         return 1f / (1f + tau / dt)
     }
 
-    private fun lowPass(value: Float, previous: Float, a: alphaType): Float =
-        previous + a.value * (value - previous)
-
-    private data class alphaType(val value: Float)
-
     private fun lowPass(value: Float, previous: Float, a: Float): Float =
         previous + a * (value - previous)
 

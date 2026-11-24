@@ -88,6 +88,8 @@ class CameraController(
 
     fun prepare(poseModel: File?, segModel: File?): Boolean = pipeline.initialize(context, poseModel, segModel)
 
+    fun pipelineGender(): Gender? = pipeline.suggestedGender()
+
     suspend fun bind(previewView: PreviewView, lensFacing: Int): String? {
         if (bound) return null
         if (!pipeline.isReady) return "Tracking models are not downloaded yet."
@@ -101,7 +103,7 @@ class CameraController(
             val latest = latestFrame
             val canvas = frame.canvas
             if (latest != null && overlayOn) {
-                renderer.render(canvas, latest, uprightRotation(), strength, gender, ghostAlpha)
+                runCatching { renderer.render(canvas, latest, uprightRotation(), strength, gender, ghostAlpha) }
             } else {
                 canvas.drawColor(0, PorterDuff.Mode.CLEAR)
             }
@@ -114,6 +116,7 @@ class CameraController(
         }
         val analysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
@@ -214,13 +217,11 @@ class CameraController(
         runCatching {
             val point = MeteringPointFactory.createPoint(
                 normalizedX.coerceIn(0.02f, 0.98f),
-                normalizedCoverY(normalizedY)
+                normalizedY.coerceIn(0.02f, 0.98f)
             )
             control.startFocusAndMetering(FocusMeteringAction.Builder(point).build())
         }
     }
-
-    private fun normalizedCoverY(value: Float): Float = value.coerceIn(0.02f, 0.98f)
 
     fun captureStill(file: File, onDone: (Boolean) -> Unit) {
         val capture = imageCapture ?: return onDone(false)
@@ -300,7 +301,7 @@ class CameraController(
             val w = small.width
             val h = small.height
             val pixels = IntArray(w * h)
-            small.getPixels(values = pixels, offset = 0, stride = w, x = 0, y = 0, width = w, height = h)
+            small.getPixels(pixels, 0, w, 0, 0, w, h)
             val luma = DoubleArray(w * h)
             for (i in pixels.indices) {
                 val c = pixels[i]
