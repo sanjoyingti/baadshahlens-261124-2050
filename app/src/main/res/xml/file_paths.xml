@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path name="stills" path="stills/" />
+    <files-path name="videos" path="videos/" />
+    <files-path name="cloud" path="cloud/" />
+    <cache-path name="cache" path="." />
+</paths>
